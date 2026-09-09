@@ -225,7 +225,11 @@ def train(
             bias="none",
             task_type="CAUSAL_LM",
         )
-        model = get_peft_model(model, lcfg)
+        model = get_peft_model(
+            model,
+            lcfg,
+            autocast_adapter_dtype=False,
+        )
         print("LoRA wrapper created. Trainable params (should be LoRA params only).")
                 # --- 在載入 model 後（以及在 inject LoRA wrapper 後）確保關閉 cache 與正確啟動 checkpointing ---
         if hasattr(model.config, "use_cache"):
