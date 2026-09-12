@@ -195,6 +195,7 @@ for idx in "${!PROTOS[@]}"; do
       --max-layer-span "$((MAX_GROUP_SIZE - 1))" \
       --pinned-layers "${pinned}" \
       --input-gate-quantile "${gate_quantile}" \
+      --require-contiguous-groups \
       --qap-permutations 1000 \
       --seed 44
     if [ ! -f "${generated_policy}" ]; then

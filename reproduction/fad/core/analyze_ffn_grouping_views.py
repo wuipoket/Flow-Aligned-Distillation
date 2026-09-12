@@ -376,6 +376,7 @@ def complete_link_clusters(
     pinned_layers: Sequence[int],
     gate_similarity: Optional[torch.Tensor] = None,
     gate_threshold: Optional[float] = None,
+    require_contiguous_groups: bool = False,
 ) -> List[List[int]]:
     layer_count = int(similarity.size(0))
     if target_clusters <= 0 or target_clusters > layer_count:
@@ -394,8 +395,13 @@ def complete_link_clusters(
                 merged_size = len(a) + len(b)
                 if max_group_size > 0 and merged_size > int(max_group_size):
                     continue
-                combined = a + b
+                combined = sorted(a + b)
                 if max_layer_span > 0 and max(combined) - min(combined) > int(max_layer_span):
+                    continue
+                if (
+                    require_contiguous_groups
+                    and combined != list(range(min(combined), max(combined) + 1))
+                ):
                     continue
                 if gate_similarity is not None:
                     if gate_threshold is None:
@@ -950,6 +956,12 @@ def parse_args() -> argparse.Namespace:
     parser.add_argument("--max-group-size", type=int, default=8, help="0 disables the size constraint")
     parser.add_argument("--max-layer-span", type=int, default=0, help="0 disables the span constraint")
     parser.add_argument(
+        "--require-contiguous-groups",
+        action=argparse.BooleanOptionalAction,
+        default=False,
+        help="Require every shared group to be a contiguous layer interval.",
+    )
+    parser.add_argument(
         "--input-gate-quantile",
         type=float,
         default=None,
@@ -1176,6 +1188,7 @@ def main() -> None:
             pinned_layers=pinned_layers,
             gate_similarity=gate_matrix,
             gate_threshold=gate_threshold,
+            require_contiguous_groups=bool(args.require_contiguous_groups),
         )
         summary, rows = summarize_clusters(name, clusters, matrix, directed_cost, symmetric_cost, regimes)
         cluster_summaries.append(summary)
@@ -1192,6 +1205,9 @@ def main() -> None:
             max_group_size=int(args.max_group_size),
             max_layer_span=int(args.max_layer_span),
             pinned_layers=pinned_layers,
+        )
+        policy["grouping_analysis"]["contiguous_groups_required"] = bool(
+            args.require_contiguous_groups
         )
         if gate_matrix is not None and gate_threshold is not None:
             policy["input_domain_gate"] = {
