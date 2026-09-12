@@ -677,7 +677,9 @@ class Reservoir:
     def tensor(self) -> torch.Tensor:
         if self.buffer is None or self.fill <= 0:
             return torch.empty((0, self.dim), dtype=torch.float32)
-        return self.buffer[: self.fill].clone()
+        # Atlas only reads these samples. Returning a view avoids cloning all
+        # three 42-layer reservoirs and temporarily doubling host RAM usage.
+        return self.buffer[: self.fill]
 
 
 def fit_kmeans(
