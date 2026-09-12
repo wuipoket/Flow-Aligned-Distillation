@@ -210,6 +210,7 @@ for idx in "${!PROTOS[@]}"; do
     --run-config "${OBS_DIR}/run_config.json" \
     --split-manifest "${SPLIT_MANIFEST}" \
     --expected-teacher "${TEACHER}" \
+    --expected-tokenizer "${TOKENIZER_NAME_OR_PATH}" \
     --expected-feature-data "${FEATURE_DATA}" \
     --expected-intervention-data "${INTERVENTION_DATA}" \
     --target-prototypes "${proto}" \

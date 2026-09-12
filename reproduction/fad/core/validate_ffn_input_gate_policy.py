@@ -33,6 +33,11 @@ def main() -> None:
     parser.add_argument("--run-config", required=True)
     parser.add_argument("--split-manifest", required=True)
     parser.add_argument("--expected-teacher", required=True)
+    parser.add_argument(
+        "--expected-tokenizer",
+        default="",
+        help="Expected tokenizer path; defaults to expected teacher for compatibility.",
+    )
     parser.add_argument("--expected-feature-data", required=True)
     parser.add_argument("--expected-intervention-data", required=True)
     parser.add_argument("--target-prototypes", type=int, default=19)
@@ -58,9 +63,14 @@ def main() -> None:
     split = load_object(split_manifest_path)
     checks: Dict[str, bool] = {}
 
+    expected_tokenizer = (
+        args.expected_tokenizer
+        if str(args.expected_tokenizer).strip()
+        else args.expected_teacher
+    )
     checks["exact_teacher"] = resolved(config.get("model_name_or_path")) == resolved(args.expected_teacher)
     checks["exact_teacher_tokenizer"] = resolved(config.get("tokenizer_name_or_path")) == resolved(
-        args.expected_teacher
+        expected_tokenizer
     )
     checks["separate_sources"] = str(config.get("data_split_mode")) == "separate_sources"
     checks["feature_path"] = resolved(config.get("feature_data_path_resolved")) == resolved(
@@ -202,7 +212,11 @@ def main() -> None:
     if failed:
         raise AssertionError(f"policy contract failed: {', '.join(failed)}; report={output}")
     print(f"[FFN-Policy-Validate] PASS policy={policy_path}")
-    print(f"[FFN-Policy-Validate] cores={len(unique_cores)} saved=9 gate={gate_threshold:.8g}")
+    print(
+        f"[FFN-Policy-Validate] cores={len(unique_cores)} "
+        f"saved={int(args.expected_layer_count) - len(unique_cores)} "
+        f"gate={gate_threshold:.8g}"
+    )
     print(f"[FFN-Policy-Validate] report={output}")
 
 
