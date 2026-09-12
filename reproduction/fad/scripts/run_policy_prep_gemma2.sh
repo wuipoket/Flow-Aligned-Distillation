@@ -84,6 +84,8 @@ case "${BACKBONE}" in
     ;;
 esac
 
+TOKENIZER_NAME_OR_PATH="${FAD_TOKENIZER_NAME_OR_PATH:-${BASE_MODEL}}"
+
 if [ "${#PROTOS[@]}" -ne "${#SHARED_MINS[@]}" ] ||
    [ "${#PROTOS[@]}" -ne "${#GATE_QUANTILES[@]}" ]; then
   echo "[Policy-Prep][Error] PROTOS, SHARED_MINS and GATE_QUANTILES must have equal lengths" >&2
@@ -137,7 +139,7 @@ if [ ! -f "${OBS_DIR}/run_config.json" ]; then
     --nproc_per_node="${NUM_GPUS}" \
     "${COLLECTOR_PY}" \
     --model_name_or_path "${TEACHER}" \
-    --tokenizer_name_or_path "${TEACHER}" \
+    --tokenizer_name_or_path "${TOKENIZER_NAME_OR_PATH}" \
     --data_path "${FEATURE_DATA}" \
     --data_kind commonsense_json \
     --feature_data_path "${FEATURE_DATA}" \
@@ -232,7 +234,7 @@ for idx in "${!PROTOS[@]}"; do
         --base_model "${BASE_MODEL}" \
         --teacher_ckpt "${TEACHER}" \
         --teacher_loader native \
-        --tokenizer_name_or_path "${TEACHER}" \
+        --tokenizer_name_or_path "${TOKENIZER_NAME_OR_PATH}" \
         --trust_remote_code False \
         --student_gradient_checkpointing False \
         --teacher_gradient_checkpointing False \
