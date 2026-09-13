@@ -12,6 +12,9 @@ from thesis_geometry_redundancy_final_gemma2 import (
     last_pred_indices,
     tokenize_records,
 )
+from thesis_common_final_llama import (
+    render_phase1_prompt_prefix,
+)
 
 
 COMPATIBILITY_MODE = "reconstructed_decision_candidate_channel_v1"
@@ -107,6 +110,136 @@ def _candidate_last_token_id(tokenizer, label: str) -> int:
     return int(token_ids[-1])
 
 
+def _flat_token_ids(encoded) -> List[int]:
+    token_ids = encoded.get("input_ids", [])
+
+    if torch.is_tensor(token_ids):
+        token_ids = token_ids.detach().cpu().tolist()
+
+    if token_ids and isinstance(token_ids[0], list):
+        if len(token_ids) != 1:
+            raise ValueError(
+                "tokenizer unexpectedly returned a batch"
+            )
+        token_ids = token_ids[0]
+
+    return [int(token_id) for token_id in token_ids]
+
+
+def _decision_item_preserving_response(
+    tokenizer,
+    record: Dict[str, Any],
+    cutoff_len: int,
+) -> Dict[str, Any]:
+    """Tokenize a decision record without truncating its response.
+
+    Long commonsense prompts can exceed cutoff_len before the response begins.
+    For decision-aligned training, preserve the complete response and truncate
+    only the oldest prompt tokens. Keep BOS when the tokenizer supplies one.
+    """
+
+    cutoff = max(2, int(cutoff_len))
+    prompt_text = render_phase1_prompt_prefix(record)
+    response_text = str(
+        record.get("output", "") or ""
+    ).strip()
+
+    if not response_text:
+        raise ValueError(
+            "decision-aligned record has an empty output"
+        )
+
+    prompt_ids = _flat_token_ids(
+        tokenizer(
+            prompt_text,
+            truncation=False,
+            padding=False,
+            add_special_tokens=True,
+        )
+    )
+    response_ids = _flat_token_ids(
+        tokenizer(
+            response_text,
+            truncation=False,
+            padding=False,
+            add_special_tokens=False,
+        )
+    )
+
+    if not response_ids:
+        raise ValueError(
+            "decision response produced no tokens"
+        )
+
+    eos_token_id = tokenizer.eos_token_id
+    suffix_ids = list(response_ids)
+
+    if (
+        eos_token_id is not None
+        and suffix_ids[-1] != int(eos_token_id)
+    ):
+        suffix_ids.append(int(eos_token_id))
+
+    if len(suffix_ids) >= cutoff:
+        raise ValueError(
+            "decision response alone exceeds cutoff_len; "
+            f"response_tokens={len(suffix_ids)} "
+            f"cutoff_len={cutoff}"
+        )
+
+    prompt_budget = cutoff - len(suffix_ids)
+
+    if len(prompt_ids) > prompt_budget:
+        bos_token_id = getattr(
+            tokenizer,
+            "bos_token_id",
+            None,
+        )
+
+        if (
+            bos_token_id is not None
+            and prompt_ids
+            and prompt_ids[0] == int(bos_token_id)
+        ):
+            if prompt_budget == 1:
+                prompt_ids = [int(bos_token_id)]
+            else:
+                prompt_ids = (
+                    [int(bos_token_id)]
+                    + prompt_ids[-(prompt_budget - 1):]
+                )
+        else:
+            prompt_ids = prompt_ids[-prompt_budget:]
+
+    input_ids = prompt_ids + suffix_ids
+
+    return {
+        "input_ids": input_ids,
+        "attention_mask": [1] * len(input_ids),
+        "prompt_len": len(prompt_ids),
+        "response_preserved_after_truncation": True,
+    }
+
+
+def _last_non_eos_token_id(
+    item: Dict[str, Any],
+    eos_token_id: Optional[int],
+) -> Optional[int]:
+    content_ids = [
+        int(token_id)
+        for token_id in item["input_ids"]
+        if (
+            eos_token_id is None
+            or int(token_id) != int(eos_token_id)
+        )
+    ]
+
+    if not content_ids:
+        return None
+
+    return int(content_ids[-1])
+
+
 def tokenize_decision_records(
     tokenizer,
     records: Sequence[Dict[str, Any]],
@@ -114,46 +247,76 @@ def tokenize_decision_records(
 ):
     tokenized: List[Dict[str, Any]] = []
 
-    # Tokenize one record at a time so a record skipped because its response was
-    # truncated cannot shift candidate metadata onto the following record.
+    # Process records independently so candidate metadata cannot shift when a
+    # record needs output-preserving prompt truncation.
     for record in records:
-        base_items = tokenize_records(
-            tokenizer,
-            [record],
-            cutoff_len=int(cutoff_len),
-        )
-        if not base_items:
-            continue
-
         labels = decision_candidate_labels(record)
         candidate_ids = [
             _candidate_last_token_id(tokenizer, label)
             for label in labels
         ]
+
         if len(set(candidate_ids)) != len(candidate_ids):
             raise ValueError(
                 "decision labels must have distinct final token IDs; "
                 f"labels={labels!r} ids={candidate_ids!r}"
             )
 
-        gold = str(record.get("answer", "") or "").strip().lower()
-        item = dict(base_items[0])
+        gold = str(
+            record.get("answer", "") or ""
+        ).strip().lower()
         gold_index = int(labels.index(gold))
+        expected_gold_id = int(candidate_ids[gold_index])
         eos_token_id = tokenizer.eos_token_id
-        content_ids = [
-            int(token_id)
-            for token_id in item["input_ids"]
-            if eos_token_id is None or int(token_id) != int(eos_token_id)
-        ]
-        if not content_ids or content_ids[-1] != candidate_ids[gold_index]:
+
+        # Preserve the existing SFT tokenization for normal-length examples.
+        base_items = tokenize_records(
+            tokenizer,
+            [record],
+            cutoff_len=int(cutoff_len),
+        )
+
+        item = (
+            dict(base_items[0])
+            if base_items
+            else None
+        )
+
+        actual_gold_id = (
+            _last_non_eos_token_id(
+                item,
+                eos_token_id,
+            )
+            if item is not None
+            else None
+        )
+
+        # A right-truncated prompt can remove the response entirely or leave a
+        # non-gold token at the sequence end. Retry by truncating only the
+        # oldest prompt tokens while retaining the complete response.
+        if actual_gold_id != expected_gold_id:
+            item = _decision_item_preserving_response(
+                tokenizer,
+                record,
+                cutoff_len=int(cutoff_len),
+            )
+            actual_gold_id = _last_non_eos_token_id(
+                item,
+                eos_token_id,
+            )
+
+        if actual_gold_id != expected_gold_id:
             raise ValueError(
-                "gold candidate final token does not match the tokenized response; "
-                f"gold={gold!r} expected={candidate_ids[gold_index]} "
-                f"actual={content_ids[-1] if content_ids else None}"
+                "gold candidate final token does not match the "
+                "output-preserving tokenized response; "
+                f"gold={gold!r} expected={expected_gold_id} "
+                f"actual={actual_gold_id}"
             )
 
         item["candidate_token_ids"] = candidate_ids
-        item["candidate_mask"] = [True] * len(candidate_ids)
+        item["candidate_mask"] = [
+            True
+        ] * len(candidate_ids)
         item["gold_candidate_index"] = gold_index
         item["candidate_labels"] = labels
         tokenized.append(item)
