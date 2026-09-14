@@ -299,20 +299,60 @@ class OursDeployLM(LM):
                 input_ids[row, : len(seq)] = torch.tensor(seq, dtype=torch.long, device=self.device)
                 attention_mask[row, : len(seq)] = 1
 
-            out = self.model(input_ids=input_ids, attention_mask=attention_mask, use_cache=False, return_dict=True)
-            log_probs = F.log_softmax(out.logits.float(), dim=-1)
+            out = self.model(
+                input_ids=input_ids,
+                attention_mask=attention_mask,
+                use_cache=False,
+                return_dict=True,
+            )
 
+            # Only convert continuation-token logits to FP32. Converting the
+            # complete [batch, sequence, vocabulary] tensor can require several
+            # additional GiB for Gemma 2's large vocabulary.
             for row, item in enumerate(chunk):
                 original_idx, request_str, _, continuation_enc = item
                 cont_len = len(continuation_enc)
-                logits = log_probs[row, in_lens[row] - cont_len : in_lens[row], :]
-                continuation_tensor = torch.tensor(continuation_enc, dtype=torch.long, device=self.device)
-                token_log_probs = logits.gather(1, continuation_tensor[:, None]).squeeze(1)
-                greedy = bool(torch.equal(logits.argmax(dim=-1), continuation_tensor))
-                answer = (float(token_log_probs.sum().item()), greedy)
-                ordered_results.append((original_idx, answer, request_str))
-                self.cache_hook.add_partial("loglikelihood", request_str, answer)
+                score_logits = out.logits[
+                    row,
+                    in_lens[row] - cont_len : in_lens[row],
+                    :,
+                ]
+                continuation_tensor = torch.tensor(
+                    continuation_enc,
+                    dtype=torch.long,
+                    device=self.device,
+                )
+                token_log_probs = F.log_softmax(
+                    score_logits.float(),
+                    dim=-1,
+                ).gather(
+                    1,
+                    continuation_tensor[:, None],
+                ).squeeze(1)
+                greedy = bool(
+                    torch.equal(
+                        score_logits.argmax(dim=-1),
+                        continuation_tensor,
+                    )
+                )
+                answer = (
+                    float(token_log_probs.sum().item()),
+                    greedy,
+                )
+                ordered_results.append(
+                    (original_idx, answer, request_str)
+                )
+                self.cache_hook.add_partial(
+                    "loglikelihood",
+                    request_str,
+                    answer,
+                )
                 pbar.update(1)
+
+            del score_logits
+            del continuation_tensor
+            del token_log_probs
+            del out
         pbar.close()
 
         ordered_results.sort(key=lambda item: item[0])
