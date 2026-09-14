@@ -2,6 +2,7 @@
 from __future__ import annotations
 
 import argparse
+import gc
 import importlib.util
 import json
 import math
@@ -81,9 +82,11 @@ class OursDeployLM(LM):
         *,
         deploy_bundle: str,
         pipeline_py: str = DEFAULT_PIPELINE,
+        base_model_name_or_path: str = "",
         tokenizer_name_or_path: str = "",
         dtype: str = "auto",
         device: str = "cuda:0",
+        stage_on_cpu: bool = False,
         batch_size: int | str = 4,
         max_length: int | None = None,
         max_gen_toks: int = 256,
@@ -93,7 +96,15 @@ class OursDeployLM(LM):
         super().__init__()
         self.deploy_bundle = str(deploy_bundle)
         self.pipeline_py = str(pipeline_py)
-        self._device = torch.device(device if torch.cuda.is_available() or str(device) == "cpu" else "cpu")
+        self.base_model_name_or_path = str(
+            base_model_name_or_path
+        ).strip()
+        self.stage_on_cpu = bool(stage_on_cpu)
+        self._device = torch.device(
+            device
+            if torch.cuda.is_available() or str(device) == "cpu"
+            else "cpu"
+        )
         self._dtype = dtype_from_name(dtype)
         self._batch_size = int(batch_size) if str(batch_size).strip().lower() != "auto" else 4
         self._max_length_override = int(max_length) if max_length else None
@@ -102,19 +113,71 @@ class OursDeployLM(LM):
         self.use_quant_bank_int4 = bool(use_quant_bank_int4)
 
         pipe = load_pipeline_module(self.pipeline_py)
-        bundle = torch.load(self.deploy_bundle, map_location="cpu")
-        self.base_model = str(bundle["base_model"])
-        self.model, self.quant_eval = pipe._build_shared_model_for_eval(
-            base_model=self.base_model,
-            atlas_payload=bundle.get("atlas", {}),
-            shared_payload=bundle["shared_student"],
-            quant_bank_int4=bundle.get("quant_bank_int4"),
-            use_quant_bank_int4=self.use_quant_bank_int4,
-            device=self._device,
-            dtype=self._dtype,
-            trust_remote_code=self.trust_remote_code,
+        bundle = torch.load(
+            self.deploy_bundle,
+            map_location="cpu",
+            mmap=True,
+            weights_only=False,
         )
-        tokenizer_name = str(tokenizer_name_or_path).strip() or self.base_model
+
+        embedded_base_model = str(bundle["base_model"])
+        self.base_model = (
+            self.base_model_name_or_path
+            or embedded_base_model
+        )
+
+        build_device = (
+            torch.device("cpu")
+            if (
+                self.stage_on_cpu
+                and self._device.type == "cuda"
+            )
+            else self._device
+        )
+
+        print(
+            "[Ours-lm-eval] model build device="
+            f"{build_device} target={self._device}"
+        )
+
+        self.model, self.quant_eval = (
+            pipe._build_shared_model_for_eval(
+                base_model=self.base_model,
+                atlas_payload=bundle.get("atlas", {}),
+                shared_payload=bundle["shared_student"],
+                quant_bank_int4=bundle.get(
+                    "quant_bank_int4"
+                ),
+                use_quant_bank_int4=(
+                    self.use_quant_bank_int4
+                ),
+                device=build_device,
+                dtype=self._dtype,
+                trust_remote_code=self.trust_remote_code,
+            )
+        )
+
+        del bundle
+        gc.collect()
+
+        if build_device != self._device:
+            if torch.cuda.is_available():
+                torch.cuda.empty_cache()
+
+            print(
+                "[Ours-lm-eval] moving compressed "
+                f"student to {self._device}"
+            )
+
+            self.model.to(
+                device=self._device,
+                dtype=self._dtype,
+            )
+
+        tokenizer_name = (
+            str(tokenizer_name_or_path).strip()
+            or self.base_model
+        )
         self.tokenizer = pipe.load_tokenizer(tokenizer_name, trust_remote_code=self.trust_remote_code)
         if self.tokenizer.pad_token_id is None:
             self.tokenizer.pad_token = self.tokenizer.eos_token
@@ -124,6 +187,10 @@ class OursDeployLM(LM):
     @property
     def batch_size(self) -> int:
         return self._batch_size
+
+    @property
+    def device(self) -> torch.device:
+        return self._device
 
     @property
     def eot_token_id(self) -> int:
@@ -329,12 +396,21 @@ def main() -> None:
     parser = argparse.ArgumentParser(description="Run lm-eval tasks on an Ours deploy_bundle.pt model.")
     parser.add_argument("--deploy_bundle", required=True)
     parser.add_argument("--pipeline_py", default=DEFAULT_PIPELINE)
+    parser.add_argument(
+        "--base_model_name_or_path",
+        default="",
+    )
     parser.add_argument("--tokenizer_name_or_path", default="")
     parser.add_argument("--tasks", default="mmlu")
     parser.add_argument("--num_fewshot", type=int, default=0)
     parser.add_argument("--batch_size", default="4")
     parser.add_argument("--dtype", default="auto")
     parser.add_argument("--device", default="cuda:0")
+    parser.add_argument(
+        "--stage_on_cpu",
+        type=str2bool,
+        default=False,
+    )
     parser.add_argument("--output_path", required=True)
     parser.add_argument("--limit", default="")
     parser.add_argument("--bootstrap_iters", type=int, default=100000)
@@ -360,9 +436,13 @@ def main() -> None:
     lm = OursDeployLM(
         deploy_bundle=args.deploy_bundle,
         pipeline_py=args.pipeline_py,
+        base_model_name_or_path=(
+            args.base_model_name_or_path
+        ),
         tokenizer_name_or_path=args.tokenizer_name_or_path,
         dtype=args.dtype,
         device=args.device,
+        stage_on_cpu=args.stage_on_cpu,
         batch_size=args.batch_size,
         trust_remote_code=args.trust_remote_code,
         use_quant_bank_int4=args.use_quant_bank_int4,
@@ -382,14 +462,26 @@ def main() -> None:
         numpy_random_seed=int(args.numpy_random_seed),
         torch_random_seed=int(args.torch_random_seed),
         fewshot_random_seed=int(args.fewshot_random_seed),
-        metadata={
-            "deploy_bundle": args.deploy_bundle,
-            "pipeline_py": args.pipeline_py,
-            "runner": "lm_eval_ours_deploy.py",
-        },
     )
     if results is None:
-        raise RuntimeError("lm-eval returned no results on this rank")
+        raise RuntimeError(
+            "lm-eval returned no results on this rank"
+        )
+
+    if isinstance(results, dict):
+        results["custom_metadata"] = {
+            "deploy_bundle": args.deploy_bundle,
+            "pipeline_py": args.pipeline_py,
+            "base_model": lm.base_model,
+            "runner": "lm_eval_ours_deploy.py",
+            "dtype": args.dtype,
+            "stage_on_cpu": bool(
+                args.stage_on_cpu
+            ),
+            "use_quant_bank_int4": bool(
+                args.use_quant_bank_int4
+            ),
+        }
 
     out_file = output_path / f"results_{started}.json"
     with out_file.open("w", encoding="utf-8") as handle:
