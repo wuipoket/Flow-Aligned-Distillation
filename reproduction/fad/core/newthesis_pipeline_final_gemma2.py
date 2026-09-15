@@ -587,6 +587,8 @@ def load_tokenized_loader(
         if normalized_prompt_mode == "decision_aligned"
         else (lambda batch: collate_tokenized_batch(batch, pad_token_id=int(tokenizer.pad_token_id)))
     )
+    loader_generator = torch.Generator()
+    loader_generator.manual_seed(int(seed))
     loader = DataLoader(
         tokenized,
         batch_size=int(batch_size),
@@ -594,6 +596,7 @@ def load_tokenized_loader(
         sampler=sampler,
         drop_last=False,
         collate_fn=collate_fn,
+        generator=loader_generator,
     )
     return loader, len(tokenized)
 
@@ -5480,10 +5483,35 @@ def stage_compress(args: argparse.Namespace) -> Dict[str, Any]:
     if hidden_mse_enabled and not hidden_mse_layer_ids:
         hidden_mse_layer_ids = list(range(layer_count))
     init_shared_student_ckpt = str(getattr(args, "init_shared_student_ckpt", "")).strip()
+    resume_training_checkpoint = str(
+        getattr(args, "resume_training_checkpoint", "")
+    ).strip()
+    latest_checkpoint_every = max(
+        0, int(getattr(args, "latest_checkpoint_every", 0))
+    )
+    latest_checkpoint_include_optimizer = bool(
+        getattr(args, "latest_checkpoint_include_optimizer", False)
+    )
+    resume_data_step = max(0, int(getattr(args, "resume_data_step", 0)))
+    if resume_training_checkpoint and init_shared_student_ckpt:
+        raise ValueError(
+            "--resume_training_checkpoint and --init_shared_student_ckpt are mutually exclusive"
+        )
+    resume_training_payload: Optional[Dict[str, Any]] = None
+    if resume_training_checkpoint:
+        loaded_resume = torch.load(
+            resume_training_checkpoint, map_location="cpu", weights_only=False
+        )
+        if not isinstance(loaded_resume, dict) or "shared_state" not in loaded_resume:
+            raise ValueError(
+                "resume training checkpoint must contain a shared_state payload"
+            )
+        resume_training_payload = loaded_resume
+        del loaded_resume
     residual_svd_init_mode = str(getattr(args, "residual_svd_init_mode", "none")).strip().lower()
     if residual_svd_init_mode not in {"none", "functional", "task_metric"}:
         raise ValueError(f"unsupported residual_svd_init_mode={residual_svd_init_mode!r}")
-    if init_shared_student_ckpt and residual_svd_init_mode != "none":
+    if (init_shared_student_ckpt or resume_training_checkpoint) and residual_svd_init_mode != "none":
         raise ValueError("residual SVD initialization cannot be combined with an explicit shared checkpoint")
     lr_bank = float(getattr(args, "lr_bank", float(args.lr)))
     lr_adapter = float(getattr(args, "lr_adapter", float(args.lr)))
@@ -5703,15 +5731,31 @@ def stage_compress(args: argparse.Namespace) -> Dict[str, Any]:
             "This pipeline does not support depth/width compression; set BASE_MODEL to match TEACHER_CKPT (or rebuild atlas with a matching teacher)."
         )
     init_shared = False
-    if init_shared_student_ckpt:
-        print(f"[Compress] loading shared init checkpoint: {init_shared_student_ckpt}", flush=True)
-        init_payload = _load_shared_payload_from_ckpt(init_shared_student_ckpt)
+    shared_initialization_path = (
+        resume_training_checkpoint or init_shared_student_ckpt
+    )
+    if shared_initialization_path:
+        label = (
+            "training resume checkpoint"
+            if resume_training_checkpoint
+            else "shared init checkpoint"
+        )
+        print(
+            f"[Compress] loading {label}: {shared_initialization_path}",
+            flush=True,
+        )
+        init_payload = (
+            dict(resume_training_payload["shared_state"])
+            if resume_training_payload is not None
+            else _load_shared_payload_from_ckpt(shared_initialization_path)
+        )
         loaded_layer_to_proto = load_shared_state(
             student,
             init_payload,
             lora_rank=int(args.lora_rank),
             lora_alpha=float(args.lora_alpha),
         )
+        del init_payload
         if [int(x) for x in loaded_layer_to_proto] != [int(x) for x in layer_to_proto]:
             raise ValueError("init_shared_student_ckpt layer_to_proto does not match atlas layer_to_proto.")
         init_shared = True
@@ -5982,6 +6026,80 @@ def stage_compress(args: argparse.Namespace) -> Dict[str, Any]:
         warmup_ratio=float(getattr(args, "lr_warmup_ratio", 0.1)),
         min_lr_ratio=float(getattr(args, "lr_min_ratio", 0.1)),
     )
+    step = 0
+    data_micro_batches_consumed = int(resume_data_step) * int(grad_accum_steps)
+    resume_best_val_loss = float("inf")
+    resume_best_val_step = -1
+    if resume_training_payload is not None:
+        step = max(0, int(resume_training_payload.get("step", 0)))
+        if step >= total_steps:
+            raise ValueError(
+                f"resume step {step} must be smaller than configured total steps {total_steps}"
+            )
+        data_micro_batches_consumed = max(
+            0,
+            int(
+                resume_training_payload.get(
+                    "data_micro_batches_consumed",
+                    step * int(grad_accum_steps),
+                )
+            ),
+        )
+        resume_best_val_step = int(
+            resume_training_payload.get("best_val_step", -1)
+        )
+        resume_best_value = resume_training_payload.get("best_val_loss")
+        resume_best_val_loss = (
+            float(resume_best_value)
+            if resume_best_value is not None
+            else float("inf")
+        )
+        mixture_resume_state = resume_training_payload.get(
+            "layer_mixture_transport_state", {}
+        )
+        if layer_mixture_transport is not None and mixture_resume_state:
+            unwrap_model(layer_mixture_transport).load_state_dict(
+                mixture_resume_state, strict=True
+            )
+        projector_resume_state = resume_training_payload.get(
+            "phase_projector_state", {}
+        )
+        if phase_projector_bank is not None and projector_resume_state:
+            unwrap_model(phase_projector_bank).load_state_dict(
+                projector_resume_state, strict=True
+            )
+        optimizer_resume_state = resume_training_payload.get("optimizer_state")
+        if optimizer_resume_state is not None:
+            optimizer.load_state_dict(optimizer_resume_state)
+            print("[Compress] restored optimizer state", flush=True)
+        else:
+            print(
+                "[Compress][Warn] periodic checkpoint has no optimizer state; "
+                "Adam moments restart, while weights/data/LR progress are preserved.",
+                flush=True,
+            )
+        scheduler_resume_state = resume_training_payload.get("scheduler_state")
+        if scheduler is not None and scheduler_resume_state is not None:
+            scheduler.load_state_dict(scheduler_resume_state)
+        saved_group_lrs = resume_training_payload.get("optimizer_group_lrs", [])
+        if isinstance(saved_group_lrs, list) and len(saved_group_lrs) == len(optimizer.param_groups):
+            for group, saved_lr in zip(optimizer.param_groups, saved_group_lrs):
+                group["lr"] = float(saved_lr)
+        python_rng_state = resume_training_payload.get("python_rng_state")
+        if python_rng_state is not None:
+            random.setstate(python_rng_state)
+        torch_rng_state = resume_training_payload.get("torch_rng_state")
+        if torch_rng_state is not None:
+            torch.set_rng_state(torch_rng_state)
+        cuda_rng_state_all = resume_training_payload.get("cuda_rng_state_all")
+        if device.type == "cuda" and cuda_rng_state_all is not None:
+            torch.cuda.set_rng_state_all(cuda_rng_state_all)
+        print(
+            f"[Compress] resumed training step={step}/{total_steps} "
+            f"data_micro_batches={data_micro_batches_consumed}",
+            flush=True,
+        )
+        resume_training_payload = None
     print(
         f"[Compress] trainable bank_params={sum(int(p.numel()) for p in bank_params)} "
         f"adapter_params={sum(int(p.numel()) for p in adapter_params)} "
@@ -6101,7 +6219,6 @@ def stage_compress(args: argparse.Namespace) -> Dict[str, Any]:
         print(f"[Compress][Warn] distill_mode={distill_mode} but lambda_kd<=0; teacher channel will be disabled.", flush=True)
     if distill_mode == "ce_hidden_mse":
         kd_coeff = 0.0
-    step = 0
     running = {
         "loss": 0.0,
         "ce": 0.0,
@@ -6175,17 +6292,24 @@ def stage_compress(args: argparse.Namespace) -> Dict[str, Any]:
     last_layer_mixture_delta_l2 = 0.0
     last_phase_adaptive_core_loss = 0.0
     last_phase_adaptive_cosine = 0.0
-    best_val_loss = float("inf")
-    best_val_step = -1
+    best_val_loss = float(resume_best_val_loss)
+    best_val_step = int(resume_best_val_step)
     best_val_ckpt_path = os.path.join(ckpt_dir, "compress_best_val.pt")
+    latest_ckpt_path = os.path.join(ckpt_dir, "compress_latest.pt")
     val_subspace_viz_dir = os.path.join(output_dir, "compress_val_subspace")
     train_sampler = loader.sampler if isinstance(getattr(loader, "sampler", None), DistributedSampler) else None
-    epoch_idx = 0
+    batches_per_epoch = max(1, int(len(loader)))
+    epoch_idx, resume_batch_offset = divmod(
+        int(data_micro_batches_consumed), batches_per_epoch
+    )
+    resume_epoch_idx = int(epoch_idx)
     pbar = step_progress(
         total=total_steps,
         desc="[Compress] train",
         miniters=log_every_steps,
     ) if is_main_process(dist_ctx) else None
+    if pbar is not None and step > 0:
+        pbar.update(int(step))
     pbar_pending = 0
     core_use_metric_whitening = bool(getattr(args, "core_use_metric_whitening", True))
     core_metric_trace_normalize = bool(getattr(args, "core_metric_trace_normalize", False))
@@ -6195,6 +6319,13 @@ def stage_compress(args: argparse.Namespace) -> Dict[str, Any]:
         f"[Compress] information_channel prompt_mode={str(getattr(args, 'training_prompt_mode', 'legacy_sft'))} "
         f"loss_scope={loss_scope} exclude_eos={loss_exclude_eos} val_selection={val_selection_metric} "
         f"include_step0={val_include_step0_candidate} min_improvement={val_min_improvement:.6g}",
+        flush=True,
+    )
+    print(
+        f"[Compress] periodic_checkpoint every={latest_checkpoint_every} "
+        f"include_optimizer={latest_checkpoint_include_optimizer} "
+        f"resume_data_step={resume_data_step} "
+        f"resume_training={bool(resume_training_checkpoint)}",
         flush=True,
     )
     if distill_mode == "sage_ib":
@@ -6230,6 +6361,10 @@ def stage_compress(args: argparse.Namespace) -> Dict[str, Any]:
             "lora_rank": int(args.lora_rank),
             "lora_alpha": float(args.lora_alpha),
             "init_shared_student_ckpt": str(init_shared_student_ckpt),
+            "resume_training_checkpoint": str(resume_training_checkpoint),
+            "resume_data_step": int(resume_data_step),
+            "latest_checkpoint_every": int(latest_checkpoint_every),
+            "latest_checkpoint_include_optimizer": bool(latest_checkpoint_include_optimizer),
             "init_shared": bool(init_shared),
             "proto_seed_strategy": str(proto_seed_strategy),
             "proto_seed_strategy_resolved": str(resolved_seed_strategy),
@@ -6314,9 +6449,95 @@ def stage_compress(args: argparse.Namespace) -> Dict[str, Any]:
             "global_batch_size": int(args.batch_size) * int(dist_ctx.world_size),
             "gradient_accumulation_steps": int(grad_accum_steps),
             "effective_global_batch_size": int(args.batch_size) * int(dist_ctx.world_size) * int(grad_accum_steps),
-            "checkpoint_policy": "best_val_only",
+            "checkpoint_policy": (
+                "best_val_plus_periodic_latest"
+                if latest_checkpoint_every > 0
+                else "best_val_only"
+            ),
             "best_val_ckpt_path": str(best_val_ckpt_path),
+            "latest_ckpt_path": str(latest_ckpt_path),
         }
+
+    def _save_periodic_latest(step_for_save: int) -> None:
+        if latest_checkpoint_every <= 0:
+            return
+        if int(step_for_save) <= 0 or int(step_for_save) % int(latest_checkpoint_every) != 0:
+            return
+        if is_main_process(dist_ctx):
+            latest_shared_state = extract_shared_state(
+                student, layer_to_proto=layer_to_proto
+            )
+            latest_mixture_state = (
+                {
+                    key: value.detach().cpu()
+                    for key, value in unwrap_model(
+                        layer_mixture_transport
+                    ).state_dict().items()
+                }
+                if layer_mixture_transport is not None
+                else {}
+            )
+            latest_projector_state = (
+                {
+                    key: value.detach().cpu()
+                    for key, value in unwrap_model(
+                        phase_projector_bank
+                    ).state_dict().items()
+                }
+                if phase_projector_bank is not None
+                else {}
+            )
+            latest_payload: Dict[str, Any] = {
+                "phase": "compress_latest",
+                "step": int(step_for_save),
+                "total_steps": int(total_steps),
+                "data_micro_batches_consumed": int(data_micro_batches_consumed),
+                "best_val_step": int(best_val_step),
+                "best_val_loss": (
+                    float(best_val_loss) if best_val_step >= 0 else None
+                ),
+                "shared_state": latest_shared_state,
+                "layer_mixture_transport_state": latest_mixture_state,
+                "phase_projector_state": latest_projector_state,
+                "scheduler_state": (
+                    scheduler.state_dict() if scheduler is not None else None
+                ),
+                "optimizer_group_lrs": [
+                    float(group["lr"]) for group in optimizer.param_groups
+                ],
+                "python_rng_state": random.getstate(),
+                "torch_rng_state": torch.get_rng_state(),
+                "cuda_rng_state_all": (
+                    torch.cuda.get_rng_state_all() if device.type == "cuda" else None
+                ),
+                "optimizer_state": (
+                    optimizer.state_dict()
+                    if latest_checkpoint_include_optimizer
+                    else None
+                ),
+                "meta": _build_compress_meta(
+                    actual_final_step=int(step_for_save),
+                    best_step=int(best_val_step),
+                    best_loss=float(best_val_loss),
+                    used_best_val_ckpt=False,
+                ),
+            }
+            temporary_path = f"{latest_ckpt_path}.tmp"
+            if os.path.exists(temporary_path):
+                os.remove(temporary_path)
+            torch.save(latest_payload, temporary_path)
+            os.replace(temporary_path, latest_ckpt_path)
+            optimizer_label = (
+                "full" if latest_checkpoint_include_optimizer else "weights+progress"
+            )
+            print(
+                f"[Compress] saved periodic latest checkpoint: "
+                f"step={step_for_save} mode={optimizer_label} "
+                f"path={latest_ckpt_path}",
+                flush=True,
+            )
+        if dist_ctx.enabled:
+            dist_barrier(dist_ctx)
 
     def _run_and_record_validation(step_for_val: int, *, allow_best: bool) -> None:
         nonlocal best_val_loss, best_val_step
@@ -6503,7 +6724,7 @@ def stage_compress(args: argparse.Namespace) -> Dict[str, Any]:
         elif dist_ctx.enabled and val_every > 0 and step_for_val % int(val_every) == 0:
             dist_barrier(dist_ctx)
 
-    if val_every > 0:
+    if val_every > 0 and step == 0:
         _run_and_record_validation(step_for_val=0, allow_best=val_include_step0_candidate)
 
     micro_in_accum = 0
@@ -6512,13 +6733,26 @@ def stage_compress(args: argparse.Namespace) -> Dict[str, Any]:
     if device.type == "cuda":
         torch.cuda.reset_peak_memory_stats(device)
     while step < total_steps:
+        current_epoch_idx = int(epoch_idx)
         if train_sampler is not None:
-            train_sampler.set_epoch(int(args.seed) + epoch_idx)
-            epoch_idx += 1
-        for batch in loader:
+            train_sampler.set_epoch(int(args.seed) + current_epoch_idx)
+        else:
+            loader_generator = getattr(loader, "generator", None)
+            if loader_generator is not None:
+                loader_generator.manual_seed(int(args.seed) + current_epoch_idx)
+        epoch_idx += 1
+        skip_batches = (
+            int(resume_batch_offset)
+            if current_epoch_idx == int(resume_epoch_idx)
+            else 0
+        )
+        for batch_idx, batch in enumerate(loader):
+            if int(batch_idx) < skip_batches:
+                continue
             if step >= total_steps:
                 break
             pending_step = int(step) + 1
+            data_micro_batches_consumed += 1
             if bank_freeze_steps > 0 and pending_step == bank_freeze_steps + 1:
                 set_shared_bank_trainable(student, True)
             input_ids = batch["input_ids"].to(device)
@@ -7841,6 +8075,8 @@ def stage_compress(args: argparse.Namespace) -> Dict[str, Any]:
                     "lr_phase_projector": 0.0,
                 }
 
+            _save_periodic_latest(step_for_save=int(step))
+
             if val_every > 0 and step % int(val_every) == 0:
                 _run_and_record_validation(step_for_val=int(step), allow_best=True)
 
@@ -7897,8 +8133,15 @@ def stage_compress(args: argparse.Namespace) -> Dict[str, Any]:
         "training_stage": str(training_stage),
         "shared_student_ckpt": ckpt_path,
         "checkpoint_dir": ckpt_dir,
-        "checkpoint_policy": "best_val_only",
+        "checkpoint_policy": (
+            "best_val_plus_periodic_latest"
+            if latest_checkpoint_every > 0
+            else "best_val_only"
+        ),
         "best_val_ckpt": best_val_ckpt_path if os.path.isfile(best_val_ckpt_path) else "",
+        "latest_checkpoint": latest_ckpt_path if os.path.isfile(latest_ckpt_path) else "",
+        "latest_checkpoint_every": int(latest_checkpoint_every),
+        "latest_checkpoint_include_optimizer": bool(latest_checkpoint_include_optimizer),
         "base_model": student_model_path,
         "teacher_model": teacher_model_path,
         "teacher_free_ce": bool(teacher_free_ce),
@@ -7917,6 +8160,8 @@ def stage_compress(args: argparse.Namespace) -> Dict[str, Any]:
             getattr(args, "sharing_parameterization", "full_parallel")
         ),
         "init_shared_student_ckpt": str(init_shared_student_ckpt),
+        "resume_training_checkpoint": str(resume_training_checkpoint),
+        "resume_data_step": int(resume_data_step),
         "init_shared": bool(init_shared),
         "residual_svd_initialization": residual_svd_init_report,
         "internal_weight_delta_initialization": internal_weight_delta_init_report,
@@ -8094,6 +8339,10 @@ def stage_compress(args: argparse.Namespace) -> Dict[str, Any]:
         )
     if is_main_process(dist_ctx):
         torch.save(payload, ckpt_path)
+        if os.path.isfile(latest_ckpt_path):
+            os.remove(latest_ckpt_path)
+            report["latest_checkpoint"] = ""
+            report["latest_checkpoint_removed_after_success"] = True
         if layer_mixture_transport is not None:
             mixture_state_path = os.path.join(output_dir, "layer_mixture_transport.pt")
             torch.save(
@@ -10337,6 +10586,14 @@ def _add_training_args_final(p: argparse.ArgumentParser) -> None:
     p.add_argument("--val_subspace_viz_enable", type=str2bool, default=False)
     p.add_argument("--val_subspace_viz_max_points_per_regime", type=int, default=256)
     p.add_argument("--init_shared_student_ckpt", type=str, default="")
+    p.add_argument("--resume_training_checkpoint", type=str, default="")
+    p.add_argument("--resume_data_step", type=int, default=0)
+    p.add_argument("--latest_checkpoint_every", type=int, default=0)
+    p.add_argument(
+        "--latest_checkpoint_include_optimizer",
+        type=str2bool,
+        default=False,
+    )
     p.add_argument(
         "--residual_svd_init_mode",
         type=str,
@@ -10407,6 +10664,10 @@ def _build_pass_namespace_final(
     stage_args.atlas_path = str(atlas_path)
     stage_args.output_dir = str(output_dir)
     stage_args.init_shared_student_ckpt = ""
+    stage_args.resume_training_checkpoint = ""
+    stage_args.resume_data_step = 0
+    stage_args.latest_checkpoint_every = 0
+    stage_args.latest_checkpoint_include_optimizer = False
     stage_args.steps = int(getattr(args, f"{prefix}_steps"))
     stage_args.lr = float(getattr(args, f"{prefix}_lr"))
     stage_args.lr_bank = float(getattr(args, f"{prefix}_lr_bank"))

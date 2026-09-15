@@ -215,6 +215,10 @@ PASS1_VAL_MIN_IMPROVEMENT="${PASS1_VAL_MIN_IMPROVEMENT:-0.0}"
 PASS1_VAL_SUBSPACE_VIZ_ENABLE="${PASS1_VAL_SUBSPACE_VIZ_ENABLE:-False}"
 PASS1_VAL_SUBSPACE_VIZ_MAX_POINTS_PER_REGIME="${PASS1_VAL_SUBSPACE_VIZ_MAX_POINTS_PER_REGIME:-256}"
 INIT_SHARED_STUDENT_CKPT="${INIT_SHARED_STUDENT_CKPT:-}"
+RESUME_TRAINING_CHECKPOINT="${RESUME_TRAINING_CHECKPOINT:-}"
+RESUME_DATA_STEP="${RESUME_DATA_STEP:-0}"
+PASS1_LATEST_CHECKPOINT_EVERY="${PASS1_LATEST_CHECKPOINT_EVERY:-0}"
+PASS1_LATEST_CHECKPOINT_INCLUDE_OPTIMIZER="${PASS1_LATEST_CHECKPOINT_INCLUDE_OPTIMIZER:-False}"
 RESIDUAL_SVD_INIT_MODE="${RESIDUAL_SVD_INIT_MODE:-none}"
 RESIDUAL_SVD_INIT_RECORDS="${RESIDUAL_SVD_INIT_RECORDS:-512}"
 RESIDUAL_SVD_INIT_RIDGE="${RESIDUAL_SVD_INIT_RIDGE:-1e-3}"
@@ -867,6 +871,9 @@ pass1_args=(
   --val_min_improvement "${PASS1_VAL_MIN_IMPROVEMENT}"
   --val_subspace_viz_enable "${PASS1_VAL_SUBSPACE_VIZ_ENABLE}"
   --val_subspace_viz_max_points_per_regime "${PASS1_VAL_SUBSPACE_VIZ_MAX_POINTS_PER_REGIME}"
+  --resume_data_step "${RESUME_DATA_STEP}"
+  --latest_checkpoint_every "${PASS1_LATEST_CHECKPOINT_EVERY}"
+  --latest_checkpoint_include_optimizer "${PASS1_LATEST_CHECKPOINT_INCLUDE_OPTIMIZER}"
   --residual_svd_init_mode "${RESIDUAL_SVD_INIT_MODE}"
   --residual_svd_init_records "${RESIDUAL_SVD_INIT_RECORDS}"
   --residual_svd_init_ridge "${RESIDUAL_SVD_INIT_RIDGE}"
@@ -880,7 +887,18 @@ if [ -n "${TEACHER_DEPLOY_BUNDLE}" ]; then
   fi
   pass1_args+=(--teacher_deploy_bundle "${TEACHER_DEPLOY_BUNDLE}")
 fi
-if [ -n "${INIT_SHARED_STUDENT_CKPT}" ]; then
+if [ -n "${RESUME_TRAINING_CHECKPOINT}" ] && [ -n "${INIT_SHARED_STUDENT_CKPT}" ]; then
+  echo "[FINAL][Error] set only one of RESUME_TRAINING_CHECKPOINT or INIT_SHARED_STUDENT_CKPT" >&2
+  exit 1
+fi
+if [ -n "${RESUME_TRAINING_CHECKPOINT}" ]; then
+  if [ ! -f "${RESUME_TRAINING_CHECKPOINT}" ]; then
+    echo "[FINAL][Error] resume training checkpoint missing: ${RESUME_TRAINING_CHECKPOINT}" >&2
+    exit 1
+  fi
+  pass1_args+=(--resume_training_checkpoint "${RESUME_TRAINING_CHECKPOINT}")
+  echo "[FINAL] periodic resume checkpoint=${RESUME_TRAINING_CHECKPOINT}"
+elif [ -n "${INIT_SHARED_STUDENT_CKPT}" ]; then
   if [ ! -f "${INIT_SHARED_STUDENT_CKPT}" ]; then
     echo "[FINAL][Error] init shared student checkpoint missing: ${INIT_SHARED_STUDENT_CKPT}" >&2
     exit 1
