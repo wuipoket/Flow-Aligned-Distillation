@@ -46,6 +46,12 @@ For the archived 25% H100 batch-1 runtime decomposition, the repository distingu
 
 Both values are recomputed from [`data/processed/runtime_25pct.csv`](data/processed/runtime_25pct.csv) and its source artifacts; they must not be interchanged.
 
+## Hardware portability and Gemma 2 extension
+
+A downstream study reproduced the compression and evaluation workflow on an AMD Radeon RX 7900 XTX and extended FAD to Gemma 2 9B. The 9.46B-parameter Teacher was reduced to a 7.58B Student, lowering allocated VRAM from 18.02 to 14.44 GiB while achieving 69.86% five-fold micro accuracy versus 74.32% for the merged Teacher. The matched BF16 benchmark showed that the memory reduction did not produce a latency speedup.
+
+These results use a separate five-fold QA protocol and are not directly comparable with the seven-task Llama-3.2-3B table above. See [`experiments/gemma2-9b-rx7900/`](experiments/gemma2-9b-rx7900/) for the complete public summary and report.
+
 ## Protocol status
 
 ### Current FAD artifact protocol
@@ -144,3 +150,4 @@ Not redistributed:
 ## License and attribution
 
 Original unpublished FAD material remains subject to [`NOTICE.md`](NOTICE.md). Third-party projects, models, and datasets retain their own terms; see [`THIRD_PARTY.md`](THIRD_PARTY.md). Citation metadata is provided in [`CITATION.cff`](CITATION.cff).
+
